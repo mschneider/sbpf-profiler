@@ -19,6 +19,7 @@ use crate::{
     program::BuiltinFunction,
     vm::{Config, ContextObject, EbpfVm},
 };
+use {crate::vm::PROFILING_STATE, bs58, std::io::Write};
 
 /// Virtual memory operation helper.
 macro_rules! translate_memory_access {
@@ -173,6 +174,22 @@ impl<'a, 'b, C: ContextObject> Interpreter<'a, 'b, C> {
     /// Returns false if the program terminated or threw an error.
     #[rustfmt::skip]
     pub fn step(&mut self) -> bool {
+        PROFILING_STATE.with(|state_cell| {
+            if let Ok(mut state) = state_cell.try_borrow_mut() {
+                if let Some(writer) = &mut state.writer {
+                    let mut stack_trace = Vec::new();
+                    stack_trace.push(self.reg[11].to_string());
+                    for i in (0..self.vm.call_depth as usize).rev() {
+                        let frame = &self.vm.call_frames[i];
+                        let call_site_pc = frame.target_pc.saturating_sub(1);
+                        stack_trace.push(call_site_pc.to_string());
+                    }
+                    let trace_line = stack_trace.join(";");
+                    let _ = writeln!(writer, "{}", trace_line);
+                }
+            }
+        });
+
         let config = &self.executable.get_config();
 
         if config.enable_instruction_meter && self.vm.due_insn_count >= self.vm.previous_instruction_meter {
@@ -532,6 +549,9 @@ impl<'a, 'b, C: ContextObject> Interpreter<'a, 'b, C> {
                     check_pc!(self, next_pc, key as u64);
                 } else if let Some((_, function)) = self.executable.get_loader().get_function_registry().lookup_by_key(insn.imm as u32) {
                     // SBPFv0 syscall
+                    if !self.try_handle_cpi_boundary(&insn) {
+                        return false;
+                    }
                     self.reg[0] = match self.dispatch_syscall(function) {
                         ProgramResult::Ok(value) => *value,
                         ProgramResult::Err(_err) => return false,
@@ -596,5 +616,43 @@ impl<'a, 'b, C: ContextObject> Interpreter<'a, 'b, C> {
         self.vm.invoke_function(function);
         self.vm.due_insn_count = 0;
         &self.vm.program_result
+    }
+
+    fn try_handle_cpi_boundary(&mut self, insn: &ebpf::Insn) -> bool {
+        if let Some((name, _)) = self
+            .executable
+            .get_loader()
+            .get_function_registry()
+            .lookup_by_key(insn.imm as u32)
+        {
+            if matches!(name, b"sol_invoke_signed_c" | b"sol_invoke_signed_rust") {
+                let instruction_va = self.reg[1];
+
+                let program_id_addr = if name == b"sol_invoke_signed_rust" {
+                    instruction_va.saturating_add(48)
+                } else {
+                    translate_memory_access!(self, load, instruction_va, u64)
+                };
+
+                let mut program_id_bytes = [0u8; 32];
+                for i in 0..4 {
+                    let chunk_addr = program_id_addr.saturating_add((i * 8) as u64);
+                    let chunk = translate_memory_access!(self, load, chunk_addr, u64);
+                    program_id_bytes[i * 8..(i + 1) * 8].copy_from_slice(&chunk.to_le_bytes());
+                }
+
+                PROFILING_STATE.with(|state_cell| {
+                    if let Ok(mut state) = state_cell.try_borrow_mut() {
+                        state.next_program_id = Some(program_id_bytes);
+
+                        if let Some(writer) = &mut state.writer {
+                            let program_id_b58 = bs58::encode(&program_id_bytes).into_string();
+                            let _ = writeln!(writer, "CPI_BOUNDARY:{}", program_id_b58);
+                        }
+                    }
+                });
+            }
+        }
+        true
     }
 }

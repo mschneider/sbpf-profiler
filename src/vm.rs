@@ -21,7 +21,17 @@ use crate::{
     program::{BuiltinFunction, BuiltinProgram, FunctionRegistry, SBPFVersion},
     static_analysis::Analysis,
 };
-use std::{collections::BTreeMap, fmt::Debug};
+use std::{cell::RefCell, collections::BTreeMap, fmt::Debug};
+use {
+    crate::profiler,
+    bs58,
+    std::{
+        env,
+        fs::{File, OpenOptions},
+        io::{BufWriter, Write},
+        path::{Path, PathBuf},
+    },
+};
 
 #[cfg(feature = "shuttle-test")]
 use shuttle::sync::Arc;
@@ -32,6 +42,25 @@ use std::sync::Arc;
 use rand::{thread_rng, Rng};
 #[cfg(all(feature = "jit", feature = "shuttle-test"))]
 use shuttle::rand::{thread_rng, Rng};
+
+pub(crate) struct ProfilingState {
+    pub(crate) writer: Option<BufWriter<File>>,
+    pub(crate) trace_path: Option<PathBuf>,
+    pub(crate) root_program_path: Option<PathBuf>,
+    pub(crate) next_program_id: Option<[u8; 32]>,
+    pub(crate) nesting_level: u32,
+}
+
+thread_local! {
+    pub(crate) static PROFILING_STATE: RefCell<ProfilingState> = const { RefCell::new(ProfilingState {
+        writer: None,
+        trace_path: None,
+        root_program_path: None,
+        next_program_id: None,
+        nesting_level: 0,
+    })
+    };
+}
 
 /// Shift the RUNTIME_ENVIRONMENT_KEY by this many bits to the LSB
 ///
@@ -215,6 +244,109 @@ pub enum RuntimeEnvironmentSlot {
     MemoryMapping = 27,
 }
 
+struct ProfilerGuard;
+
+impl ProfilerGuard {
+    fn new() -> Option<Self> {
+        if env::var("SBPF_PROFILE").is_err() {
+            return None;
+        }
+
+        let mut guard_created = false;
+        PROFILING_STATE.with(|state_cell| {
+            let mut state = state_cell.borrow_mut();
+
+            if state.nesting_level == 0 {
+                if let Ok(root_program_str) = env::var("SBPF_PROFILE") {
+                    let root_program_path = PathBuf::from(root_program_str);
+                    if !root_program_path.is_file() {
+                        eprintln!(
+                            "[SBPF Profiler] Path in SBPF_PROFILE is not a file: {:?}",
+                            root_program_path
+                        );
+                        return;
+                    }
+                    let output_dir = root_program_path.parent().unwrap_or_else(|| Path::new("."));
+                    let trace_path =
+                        output_dir.join(format!("sbpf_trace_{}.raw", uuid::Uuid::new_v4()));
+
+                    match OpenOptions::new()
+                        .create(true)
+                        .write(true)
+                        .truncate(true)
+                        .open(&trace_path)
+                    {
+                        Ok(file) => {
+                            state.writer = Some(BufWriter::new(file));
+                            state.trace_path = Some(trace_path.clone());
+                            state.root_program_path = Some(root_program_path);
+                            println!(
+                                "[SBPF Profiler] Enabled. Writing raw trace to: {:?}",
+                                trace_path
+                            );
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "[SBPF Profiler] Failed to create trace file at {:?}: {}",
+                                trace_path, e
+                            );
+                            return;
+                        }
+                    };
+                }
+            }
+
+            // If a writer is present, it means we are in an active profiling session.
+            if state.writer.is_some() {
+                state.nesting_level += 1;
+                guard_created = true;
+            }
+        });
+
+        if guard_created {
+            Some(ProfilerGuard)
+        } else {
+            None
+        }
+    }
+}
+
+impl Drop for ProfilerGuard {
+    fn drop(&mut self) {
+        PROFILING_STATE.with(|state_cell| {
+            let mut state = state_cell.borrow_mut();
+
+            if state.nesting_level > 0 {
+                state.nesting_level -= 1;
+
+                if state.nesting_level == 0 {
+                    // Last guard is being dropped
+                    let mut writer = state.writer.take();
+                    let trace_path = state.trace_path.take();
+                    let root_program_path = state.root_program_path.take();
+
+                    if let Some(ref mut writer) = writer {
+                        let _ = writer.flush();
+                    }
+                    drop(writer);
+
+                    if let (Some(trace_path), Some(root_path)) = (trace_path, root_program_path) {
+                        if trace_path.exists() {
+                            match profiler::process_trace_file(&trace_path, &root_path) {
+                                Ok(svg_path) => {
+                                    println!("[SBPF Profiler] Success! Flamechart written to: {:?}", svg_path);
+                                    let _ = std::fs::remove_file(&trace_path);
+                                }
+                                Err(e) => eprintln!("[SBPF Profiler] Error during symbolization: {}. Raw trace file kept at {:?}", e, trace_path),
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
+}
+
 /// A virtual machine to run eBPF programs.
 ///
 /// # Examples
@@ -350,6 +482,34 @@ impl<'a, C: ContextObject> EbpfVm<'a, C> {
         executable: &Executable<C>,
         interpreted: bool,
     ) -> (u64, ProgramResult) {
+        let _profiler_guard = ProfilerGuard::new();
+
+        self.execute_program_inner(executable, env::var("SBPF_PROFILE").is_ok() || interpreted)
+    }
+
+    fn execute_program_inner(
+        &mut self,
+        executable: &Executable<C>,
+        interpreted: bool,
+    ) -> (u64, ProgramResult) {
+        PROFILING_STATE.with(|state_cell| {
+            if let Ok(mut state) = state_cell.try_borrow_mut() {
+                let program_id_str = state
+                    .next_program_id
+                    .take()
+                    .map(|id| bs58::encode(id).into_string())
+                    .unwrap_or_else(|| "ROOT_PLACEHOLDER".to_string());
+
+                if let Some(mut writer) = state.writer.take() {
+                    if writeln!(writer, "VM_START:{}", program_id_str).is_ok() {
+                        state.writer = Some(writer);
+                    } else {
+                        eprintln!("[SBPF Profiler] Error writing to trace file, disabling.");
+                    }
+                }
+            }
+        });
+
         debug_assert!(Arc::ptr_eq(&self.loader, executable.get_loader()));
         self.registers[11] = executable.get_entrypoint_instruction_offset() as u64;
         let config = executable.get_config();
@@ -394,6 +554,18 @@ impl<'a, C: ContextObject> EbpfVm<'a, C> {
         };
         let mut result = ProgramResult::Ok(0);
         std::mem::swap(&mut result, &mut self.program_result);
+
+        PROFILING_STATE.with(|state_cell| {
+            if let Ok(mut state) = state_cell.try_borrow_mut() {
+                if let Some(writer) = &mut state.writer {
+                    if let Err(e) = writeln!(writer, "VM_END") {
+                        eprintln!("[SBPF Profiler] Error writing to trace file: {}", e);
+                        state.writer = None;
+                    }
+                }
+            }
+        });
+
         (instruction_count, result)
     }
 
