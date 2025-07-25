@@ -1,94 +1,54 @@
-# solana-sbpf
+# sbpf-profiler
 
-SBPF virtual machine
+Drop-in fork of Solana's [SBPF VM](https://github.com/anza-xyz/sbpf) that adds execution profiling. Generates flame charts showing function-level compute unit usage across program and CPI boundaries.
 
-[![Build Status](https://github.com/anza-xyz/sbpf/actions/workflows/main.yml/badge.svg)](https://github.com/anza-xyz/sbpf/actions/workflows/main.yml)
-[![Crates.io](https://img.shields.io/crates/v/solana-sbpf.svg)](https://crates.io/crates/solana-sbpf)
 
-## Description
 
-This is a fork of [RBPF](https://github.com/solana-labs/rbpf) which in turn is a fork of [RBPF](https://github.com/qmonnet/rbpf) by Quentin Monnet.
+## [Example output](https://793ea0d2.sbpf-profiler.pages.dev/)
 
-This crate contains a virtual machine for eBPF program execution. BPF, as in
-_Berkeley Packet Filter_, is an assembly-like language initially developed for
-BSD systems, in order to filter packets in the kernel with tools such as
-tcpdump so as to avoid useless copies to user-space. It was ported to Linux,
-where it evolved into eBPF (_extended_ BPF), a faster version with more
-features. While BPF programs are originally intended to run in the kernel, the
-virtual machine of this crate enables running it in user-space applications;
-it contains an interpreter, an x86_64 JIT-compiler for eBPF programs, as well as
-an assembler, disassembler and verifier.
+---
 
-The crate is supposed to compile and run on Linux, MacOS X, and Windows,
-although the JIT-compiler does not work with Windows at this time.
+## Guide
 
-## Link to the crate
+1. **Build your program with debug symbols**  
+   You will need the unstripped version of the Solana program you want to profile.
+   ```bash
+   cargo build-sbf
+   # produces:
+   #   target/deploy/                          -> stripped .so ❌
+   #   target/sbf-solana-solana/release/       -> unstripped .so - This is the one we need ✅
+   ```
 
-This crate is available from [crates.io](https://crates.io/crates/solana-sbpf),
-so it should work out of the box by adding it as a dependency in your
-`Cargo.toml` file:
+2. **Add the profiler to your project**  
+   Wherever you run your Solana programs, configure `Cargo.toml` to use this fork instead of the original `sbpf`.
+   ```toml
+   [patch.crates-io]
+   solana-sbpf = { git = "https://github.com/serbangv/sbpf-profiler" }     # v0.12.2
+   ```
 
-```toml
-[dependencies]
-solana-sbpf = "0.12.2"
-```
+3. **Run with profiling enabled**  
+   To enabled profiling for your run, you need to pass `SBPF_PROFILE` env variable, pointing to the unstripped .so file from the 1st step.
 
-You can also use the development version from this GitHub repository. This
-should be as simple as putting this inside your `Cargo.toml`:
+   For example, when using `mollusk`, the command looks like this:
+   ```bash
+   SBPF_PROFILE=/absolute/path/to/<unstripped_program>.so cargo test -p my-test -- --nocapture
+   ```
 
-```toml
-[dependencies]
-solana-sbpf = { git = "https://github.com/anza-xyz/sbpf", branch = "main" }
-```
+   **NOTE:** If you have programs into which you're doing CPIs and you  want those programs' functions to also be present in the profile, you can include their **unstripped** .so files in the same directory as the file pointed to by the `SBPF_PROFILE` env var, use their pubkey as the file name and the profiler will load them.
 
-Of course, if you prefer, you can clone it locally, possibly hack the crate,
-and then indicate the path of your local version in `Cargo.toml`:
+   For example, if my program has CPI calls into the Token and Associated Token Programs, the directory that holds the **unstripped** .so files will look like:
 
-```toml
-[dependencies]
-solana-sbpf = { path = "path/to/sbpf" }
-```
+   ```
+   my_program_directory/
+   ├── my_program.so # Main program
+   ├── TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA.so # Token Program
+   └── ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL.so # Associated Token Program
+   ```
 
-Then indicate in your source code that you want to use the crate:
+4. **Final step**  
+   On success you’ll see a log line like:
+   ```
+   [SBPF Profiler] Success! Flamechart written to: "/absolute/path/to/flamechart_<unique_id>.svg"
+   ```
+   You can now open the interactive SVG in your browser.
 
-```rust,ignore
-extern crate solana_sbpf;
-```
-
-## API
-
-The API is pretty well documented inside the source code. You should also be
-able to access [an online version of the documentation from
-here](https://docs.rs/solana-sbpf/), automatically generated from the
-[crates.io](https://crates.io/crates/solana-sbpf)
-version (may not be up-to-date with master branch).
-[Examples](examples), [unit tests](tests) and [performance benchmarks](benches)
-should also prove helpful.
-
-Here are the steps to follow to run an SBPF:
-
-1. Create the config and a loader built-in program, add some functions.
-2. Create an executable, either from the bytecode or an ELF.
-3. If you want a JIT-compiled program, compile it.
-4. Create a memory mapping, consisting of multiple memory regions.
-5. Create a context object which will also acts as instruction meter.
-6. Create a virtual machine using all of the previous steps.
-7. Execute your program: Either run the interpreter or call the JIT-compiled
-   function.
-
-## Developer
-
-### Dependencies
-- rustc version 1.83 or higher
-
-### Build and test instructions
-- To build run `cargo build`
-- To test run `cargo test`
-
-## License
-
-Following the effort of the Rust language project itself in order to ease
-integration with other projects, the sbpf crate is distributed under the terms
-of both the MIT license and the Apache License (Version 2.0).
-
-See [LICENSE-APACHE](LICENSE-APACHE) and [LICENSE-MIT](LICENSE-MIT) for details.
