@@ -4,7 +4,7 @@ Drop-in fork of Solana's [SBPF VM](https://github.com/anza-xyz/sbpf) that adds e
 
 
 
-## [Example output](https://793ea0d2.sbpf-profiler.pages.dev/)
+## [Example output](https://sbpf-profiler.pages.dev/)
 
 ---
 
