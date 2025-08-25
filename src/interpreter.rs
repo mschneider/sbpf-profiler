@@ -12,6 +12,7 @@
 
 //! Interpreter for eBPF programs.
 
+use crate::profiling::{SyscallProfilingCtx, PROFILING_STATE};
 use crate::{
     ebpf,
     elf::Executable,
@@ -19,7 +20,7 @@ use crate::{
     program::BuiltinFunction,
     vm::{Config, ContextObject, EbpfVm},
 };
-use {crate::vm::PROFILING_STATE, bs58, std::io::Write};
+use std::io::Write;
 
 /// Virtual memory operation helper.
 macro_rules! translate_memory_access {
@@ -176,16 +177,19 @@ impl<'a, 'b, C: ContextObject> Interpreter<'a, 'b, C> {
     pub fn step(&mut self) -> bool {
         PROFILING_STATE.with(|state_cell| {
             if let Ok(mut state) = state_cell.try_borrow_mut() {
-                if let Some(writer) = &mut state.writer {
-                    let mut stack_trace = Vec::new();
-                    stack_trace.push(self.reg[11].to_string());
-                    for i in (0..self.vm.call_depth as usize).rev() {
-                        let frame = &self.vm.call_frames[i];
-                        let call_site_pc = frame.target_pc.saturating_sub(1);
-                        stack_trace.push(call_site_pc.to_string());
+                let should_trace = state.symbolizable_stack.last().copied().unwrap_or(true);
+                if should_trace {
+                    if let Some(writer) = &mut state.writer {
+                        let mut stack_trace = Vec::new();
+                        stack_trace.push(self.reg[11].to_string());
+                        for i in (0..self.vm.call_depth as usize).rev() {
+                            let frame = &self.vm.call_frames[i];
+                            let call_site_pc = frame.target_pc.saturating_sub(1);
+                            stack_trace.push(call_site_pc.to_string());
+                        }
+                        let trace_line = stack_trace.join(";");
+                        let _ = writeln!(writer, "{}", trace_line);
                     }
-                    let trace_line = stack_trace.join(";");
-                    let _ = writeln!(writer, "{}", trace_line);
                 }
             }
         });
@@ -537,17 +541,15 @@ impl<'a, 'b, C: ContextObject> Interpreter<'a, 'b, C> {
             // Do not delegate the check to the verifier, since self.registered functions can be
             // changed after the program has been verified.
             ebpf::CALL_IMM => {
-                let key = self
-                    .executable
-                    .get_sbpf_version()
-                    .calculate_call_imm_target_pc(self.reg[11] as usize, insn.imm);
-                if self.executable.get_sbpf_version().static_syscalls() {
-                    // make BPF to BPF call
-                    if !self.push_frame(config) {
-                        return false;
-                    }
-                    check_pc!(self, next_pc, key as u64);
-                } else if let Some((_, function)) = self.executable.get_loader().get_function_registry().lookup_by_key(insn.imm as u32) {
+                if let (false, Some((function_name, function))) = (
+                    self.executable.get_sbpf_version().static_syscalls(),
+                    self.executable
+                        .get_loader()
+                        .get_function_registry()
+                        .lookup_by_key(insn.imm as u32),
+                ) {
+                    let syscall_ctx = SyscallProfilingCtx::new(function_name, self);
+                    syscall_ctx.emit_start_event();
                     // SBPFv0 syscall
                     if !self.try_handle_cpi_boundary(&insn) {
                         return false;
@@ -556,6 +558,7 @@ impl<'a, 'b, C: ContextObject> Interpreter<'a, 'b, C> {
                         ProgramResult::Ok(value) => *value,
                         ProgramResult::Err(_err) => return false,
                     };
+                    syscall_ctx.emit_end_event(self.vm.context_object_pointer.get_remaining());
                 } else if let Some((_, target_pc)) =
                     self.executable
                     .get_function_registry()
@@ -626,33 +629,45 @@ impl<'a, 'b, C: ContextObject> Interpreter<'a, 'b, C> {
             .lookup_by_key(insn.imm as u32)
         {
             if matches!(name, b"sol_invoke_signed_c" | b"sol_invoke_signed_rust") {
-                let instruction_va = self.reg[1];
-
-                let program_id_addr = if name == b"sol_invoke_signed_rust" {
-                    instruction_va.saturating_add(48)
-                } else {
-                    translate_memory_access!(self, load, instruction_va, u64)
-                };
-
-                let mut program_id_bytes = [0u8; 32];
-                for i in 0..4 {
-                    let chunk_addr = program_id_addr.saturating_add((i * 8) as u64);
-                    let chunk = translate_memory_access!(self, load, chunk_addr, u64);
-                    program_id_bytes[i * 8..(i + 1) * 8].copy_from_slice(&chunk.to_le_bytes());
-                }
-
                 PROFILING_STATE.with(|state_cell| {
                     if let Ok(mut state) = state_cell.try_borrow_mut() {
-                        state.next_program_id = Some(program_id_bytes);
-
-                        if let Some(writer) = &mut state.writer {
-                            let program_id_b58 = bs58::encode(&program_id_bytes).into_string();
-                            let _ = writeln!(writer, "CPI_BOUNDARY:{}", program_id_b58);
-                        }
+                        state.next_program_id = Some(self.get_cpi_program_id(name));
                     }
                 });
             }
         }
         true
+    }
+
+    pub(crate) fn get_cpi_program_id(&mut self, name: &[u8]) -> [u8; 32] {
+        let instruction_va = self.reg[1];
+
+        let program_id_addr = if name == b"sol_invoke_signed_rust" {
+            instruction_va.saturating_add(48)
+        } else {
+            match self.vm.memory_mapping.load::<u64>(instruction_va) {
+                ProgramResult::Ok(v) => v,
+                ProgramResult::Err(_) => {
+                    panic!(
+                        "[SBPF Profiler] Error during reading CPI Program ID address from memory"
+                    );
+                }
+            }
+        };
+
+        let mut program_id = [0u8; 32];
+        for i in 0..4 {
+            let chunk_addr = program_id_addr.saturating_add((i * 8) as u64);
+
+            let chunk = match self.vm.memory_mapping.load::<u64>(chunk_addr) {
+                ProgramResult::Ok(v) => v,
+                ProgramResult::Err(_) => {
+                    panic!("[SBPF Profiler] Error during reading CPI Program ID from memory");
+                }
+            };
+            program_id[i * 8..(i + 1) * 8].copy_from_slice(&chunk.to_le_bytes());
+        }
+
+        program_id
     }
 }
