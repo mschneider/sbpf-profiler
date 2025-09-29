@@ -42,11 +42,7 @@ use {
 use crate::profiling::PROFILING_STATE;
 #[cfg(feature = "shuttle-test")]
 use shuttle::sync::Arc;
-#[cfg(not(feature = "shuttle-test"))]
-use std::sync::Arc;
 
-#[cfg(all(feature = "jit", not(feature = "shuttle-test")))]
-use rand::{thread_rng, Rng};
 #[cfg(all(feature = "jit", feature = "shuttle-test"))]
 use shuttle::rand::{thread_rng, Rng};
 
